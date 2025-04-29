@@ -7,6 +7,8 @@
 
                                https://mfem.org
 
+Here, we have added parallel functionality for isogeometric analysis in the H(curl) space to the core code of MFEM, using NURBS as basis functions. Additionally, essential implementations for electromagnetic simulations are provided in the ​hcurl_iga​ folder. A multi-frequency solution method for time-varying systems has also been introduced.
+
 [MFEM](https://mfem.org) is a modular parallel C++ library for finite element
 methods. Its goal is to enable high-performance scalable finite element
 discretization research and application development on a wide variety of
