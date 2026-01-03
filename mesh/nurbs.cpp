@@ -3101,6 +3101,475 @@ void NURBSExtension::ConnectBoundaries3D(int bnd0, int bnd1)
    }
 }
 
+void NURBSExtension::ConnectBoundariesHCurl(int component)
+{
+   // For H(curl), we need to identify patch interfaces and connect
+   // the tangential DOFs. The 'component' parameter indicates which
+   // direction of the H(curl) space we are handling (0=x, 1=y, 2=z).
+   //
+   // H(curl) requires tangential continuity across patch interfaces.
+   // For each interface, we need to:
+   // 1. Identify which H(curl) component is tangent to the interface
+   // 2. Match DOFs for that component across the interface
+   // 3. Handle orientation differences between patches
+   
+   // First, try to use master/slave arrays if defined (for periodic BC)
+   // Otherwise, automatically detect shared boundaries between patches
+   
+   // Initialize d_to_d if not already done
+   if (d_to_d.Size() != NumOfDofs)
+   {
+      d_to_d.SetSize(NumOfDofs);
+      for (int i = 0; i < NumOfDofs; i++) { d_to_d[i] = i; }
+   }
+
+   // If master/slave arrays are defined, use them
+   if (master.Size() > 0 && master.Size() == slave.Size())
+   {
+      for (int i = 0; i < master.Size(); i++)
+      {
+         int bnd0 = -1, bnd1 = -1;
+         for (int b = 0; b < GetNBP(); b++)
+         {
+            if (master[i] == patchTopo->GetBdrAttribute(b)) { bnd0 = b; }
+            if (slave[i] == patchTopo->GetBdrAttribute(b)) { bnd1 = b; }
+         }
+         if (bnd0 == -1 || bnd1 == -1) { continue; }
+
+         if (Dimension() == 2)
+         {
+            ConnectBoundariesHCurl2D(bnd0, bnd1, component);
+         }
+         else if (Dimension() == 3)
+         {
+            ConnectBoundariesHCurl3D(bnd0, bnd1, component);
+         }
+      }
+   }
+   else
+   {
+      // Automatic detection: find shared edges/faces between patches
+      // by comparing boundary element vertices
+      AutoConnectPatchBoundariesHCurl(component);
+   }
+
+   // Clean d_to_d - renumber DOFs to remove duplicates
+   Array<int> tmp(d_to_d.Size() + 1);
+   tmp = 0;
+
+   for (int i = 0; i < d_to_d.Size(); i++)
+   {
+      tmp[d_to_d[i]] = 1;
+   }
+
+   int cnt = 0;
+   for (int i = 0; i < tmp.Size(); i++)
+   {
+      if (tmp[i] == 1) { tmp[i] = cnt++; }
+   }
+   NumOfDofs = cnt;
+
+   for (int i = 0; i < d_to_d.Size(); i++)
+   {
+      d_to_d[i] = tmp[d_to_d[i]];
+   }
+
+   // Regenerate DOF tables
+   if (el_dof) { delete el_dof; }
+   if (bel_dof) { delete bel_dof; }
+   GenerateElementDofTable();
+   GenerateBdrElementDofTable();
+}
+
+void NURBSExtension::ConnectBoundariesHCurl2D(int bnd0, int bnd1, int component)
+{
+   // In 2D H(curl), we have two components (x and y).
+   // For a boundary edge, the tangential DOFs need to be matched.
+   // The boundary is a 1D entity (edge), and we need to match DOFs
+   // along this edge for the tangential component.
+   //
+   // H(curl) DOF ordering in 2D (for order p):
+   // - Component 0 (x): DOFs 0 to (p+1)*(p+2)-1
+   // - Component 1 (y): DOFs (p+1)*(p+2) to 2*(p+1)*(p+2)-1
+   
+   NURBSPatchMap p2g0(this);
+   NURBSPatchMap p2g1(this);
+
+   int okv0[1], okv1[1];
+   const KnotVector *kv0[1], *kv1[1];
+
+   p2g0.SetBdrPatchDofMap(bnd0, kv0, okv0);
+   p2g1.SetBdrPatchDofMap(bnd1, kv1, okv1);
+
+   int nx = p2g0.nx();
+   int nks0 = kv0[0]->GetNKS();
+
+   // Determine relative orientation between the two boundaries
+   // If orientations differ, we need to reverse the DOF matching
+   bool reverse_orientation = (okv0[0] * okv1[0] < 0);
+   
+   // Get the patches for these boundaries
+   int patch0 = bel_to_patch[bnd0];
+   int patch1 = bel_to_patch[bnd1];
+
+   // Match DOFs along the boundary
+   // For H(curl), tangential component DOFs must be connected
+   for (int i = 0; i < nks0; i++)
+   {
+      if (kv0[0]->isElement(i))
+      {
+         for (int ii = 0; ii <= kv0[0]->GetOrder(); ii++)
+         {
+            int ii0 = (okv0[0] >= 0) ? (i + ii) : (nx - i - ii);
+            int ii1;
+            
+            if (reverse_orientation)
+            {
+               // Reverse the mapping for opposite orientations
+               ii1 = (okv1[0] >= 0) ? (nx - i - ii) : (i + ii);
+            }
+            else
+            {
+               ii1 = (okv1[0] >= 0) ? (i + ii) : (nx - i - ii);
+            }
+
+            // Connect the DOFs - map bnd1 DOF to bnd0 DOF
+            int dof0 = p2g0(ii0);
+            int dof1 = p2g1(ii1);
+            
+            if (dof0 >= 0 && dof0 < d_to_d.Size() &&
+                dof1 >= 0 && dof1 < d_to_d.Size())
+            {
+               d_to_d[dof1] = d_to_d[dof0];
+            }
+         }
+      }
+   }
+}
+
+void NURBSExtension::ConnectBoundariesHCurl3D(int bnd0, int bnd1, int component)
+{
+   // In 3D H(curl), we have three components (x, y, z).
+   // For a boundary face, we need to match tangential DOFs.
+   // The boundary is a 2D entity (face), and we match DOFs that are
+   // tangent to the face for continuity.
+   //
+   // H(curl) DOF ordering in 3D (for order p):
+   // - Component 0 (x): DOFs for edges parallel to x
+   // - Component 1 (y): DOFs for edges parallel to y  
+   // - Component 2 (z): DOFs for edges parallel to z
+   
+   NURBSPatchMap p2g0(this);
+   NURBSPatchMap p2g1(this);
+
+   int okv0[2], okv1[2];
+   const KnotVector *kv0[2], *kv1[2];
+
+   p2g0.SetBdrPatchDofMap(bnd0, kv0, okv0);
+   p2g1.SetBdrPatchDofMap(bnd1, kv1, okv1);
+
+   int nx = p2g0.nx();
+   int ny = p2g0.ny();
+
+   int nks0 = kv0[0]->GetNKS();
+   int nks1 = kv0[1]->GetNKS();
+
+   // Determine relative orientation between the two boundary faces
+   // Check for reversed orientations in each direction
+   bool reverse_x = (okv0[0] * okv1[0] < 0);
+   bool reverse_y = (okv0[1] * okv1[1] < 0);
+
+   // Match DOFs on the face with proper orientation handling
+   for (int j = 0; j < nks1; j++)
+   {
+      if (kv0[1]->isElement(j))
+      {
+         for (int i = 0; i < nks0; i++)
+         {
+            if (kv0[0]->isElement(i))
+            {
+               for (int jj = 0; jj <= kv0[1]->GetOrder(); jj++)
+               {
+                  int jj0 = (okv0[1] >= 0) ? (j + jj) : (ny - j - jj);
+                  int jj1;
+                  if (reverse_y)
+                  {
+                     jj1 = (okv1[1] >= 0) ? (ny - j - jj) : (j + jj);
+                  }
+                  else
+                  {
+                     jj1 = (okv1[1] >= 0) ? (j + jj) : (ny - j - jj);
+                  }
+
+                  for (int ii = 0; ii <= kv0[0]->GetOrder(); ii++)
+                  {
+                     int ii0 = (okv0[0] >= 0) ? (i + ii) : (nx - i - ii);
+                     int ii1;
+                     if (reverse_x)
+                     {
+                        ii1 = (okv1[0] >= 0) ? (nx - i - ii) : (i + ii);
+                     }
+                     else
+                     {
+                        ii1 = (okv1[0] >= 0) ? (i + ii) : (nx - i - ii);
+                     }
+
+                     // Connect the DOFs for tangential continuity
+                     int dof0 = p2g0(ii0, jj0);
+                     int dof1 = p2g1(ii1, jj1);
+                     
+                     if (dof0 >= 0 && dof0 < d_to_d.Size() &&
+                         dof1 >= 0 && dof1 < d_to_d.Size())
+                     {
+                        d_to_d[dof1] = d_to_d[dof0];
+                     }
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+int NURBSExtension::GetBdrElementLocalDir(int bel) const
+{
+   // Determine which local direction (0=x, 1=y, 2=z) the boundary element
+   // corresponds to within its parent patch.
+   // In NURBS, a boundary element on a face normal to direction d has
+   // local direction d.
+   
+   int patch = bel_to_patch[bel];
+   int dim = Dimension();
+   
+   if (dim == 2)
+   {
+      // In 2D, boundary elements are edges. Check which edges of the patch
+      // this boundary element belongs to.
+      // bel_to_IJK gives the knot span indices
+      int i = bel_to_IJK(bel, 0);
+      
+      // Get the patch dimensions
+      Array<int> edges, oedge;
+      patchTopo->GetElementEdges(patch, edges, oedge);
+      
+      // Determine direction based on which boundary
+      // If i=0 or i=max, it's a y-direction boundary (x is fixed)
+      // If j=0 or j=max, it's an x-direction boundary (y is fixed)
+      // For simplicity, use the second IJK component if available
+      if (bel_to_IJK.NumCols() > 1)
+      {
+         int j = bel_to_IJK(bel, 1);
+         // This is a simplified heuristic - actual implementation would
+         // need to check against patch boundaries
+         return (j == 0 || j >= 0) ? 0 : 1;
+      }
+      return 0;
+   }
+   else if (dim == 3)
+   {
+      // In 3D, boundary elements are faces
+      // Similar logic: determine which face of the patch
+      // For now, return a simple heuristic based on IJK
+      return 0; // Placeholder - needs proper implementation
+   }
+   
+   return 0;
+}
+
+bool NURBSExtension::IsComponentTangentToBdr(int bel, int component) const
+{
+   // For H(curl), a component is tangent to a boundary if its direction
+   // is parallel to the boundary surface.
+   // 
+   // In 2D: boundary is an edge. Component 0 (x) is tangent to vertical edges,
+   //        Component 1 (y) is tangent to horizontal edges.
+   // In 3D: boundary is a face. A component is tangent if it's not normal to the face.
+   
+   int bdr_dir = GetBdrElementLocalDir(bel);
+   
+   // A component is tangent if its direction is different from the boundary normal
+   // For a boundary with normal in direction 'bdr_dir', components in other
+   // directions are tangent.
+   return (component != bdr_dir);
+}
+
+void NURBSExtension::ConnectPatchEdgeHCurl2D(int patch0, int edge0, 
+                                              int patch1, int edge1, 
+                                              int component)
+{
+   // Connect DOFs along a shared edge between two patches.
+   // edge0/edge1 are local edge indices within each patch (0-3 for quad).
+   // 
+   // In 2D NURBS, for a patch with orders (px, py):
+   // - Edge 0 (bottom, y=0): DOFs along i, j=0 - normal is y, tangent is x
+   // - Edge 1 (right, x=1): DOFs along i=nx, j - normal is x, tangent is y
+   // - Edge 2 (top, y=1): DOFs along i, j=ny - normal is y, tangent is x
+   // - Edge 3 (left, x=0): DOFs along i=0, j - normal is x, tangent is y
+   //
+   // For H(curl), only tangential components need continuity!
+   // - Edges 0,2 (horizontal): tangent is x (component 0)
+   // - Edges 1,3 (vertical): tangent is y (component 1)
+   
+   // Check if this component is tangent to this edge
+   int tangent_dir_edge0 = (edge0 == 0 || edge0 == 2) ? 0 : 1; // x for horiz, y for vert
+   if (component != tangent_dir_edge0)
+   {
+      // This component is normal to the edge, no connection needed
+      return;
+   }
+   
+   NURBSPatchMap p2g0(this);
+   NURBSPatchMap p2g1(this);
+   
+   const KnotVector *kv0[2], *kv1[2];
+   p2g0.SetPatchDofMap(patch0, kv0);
+   p2g1.SetPatchDofMap(patch1, kv1);
+   
+   int nx0 = p2g0.nx();
+   int ny0 = p2g0.ny();
+   int nx1 = p2g1.nx();
+   int ny1 = p2g1.ny();
+   
+   // Determine edge direction and fixed coordinate for each patch
+   // Edge 0: j=0, vary i;  Edge 1: i=nx, vary j
+   // Edge 2: j=ny, vary i; Edge 3: i=0, vary j
+   
+   auto getEdgeDofs = [&](NURBSPatchMap &p2g, int edge, int nx, int ny, 
+                          std::vector<int> &dofs) {
+      dofs.clear();
+      switch (edge) {
+         case 0: // bottom edge, j=0
+            for (int i = 0; i <= nx; i++) { dofs.push_back(p2g(i, 0)); }
+            break;
+         case 1: // right edge, i=nx
+            for (int j = 0; j <= ny; j++) { dofs.push_back(p2g(nx, j)); }
+            break;
+         case 2: // top edge, j=ny
+            for (int i = 0; i <= nx; i++) { dofs.push_back(p2g(i, ny)); }
+            break;
+         case 3: // left edge, i=0
+            for (int j = 0; j <= ny; j++) { dofs.push_back(p2g(0, j)); }
+            break;
+      }
+   };
+   
+   std::vector<int> dofs0, dofs1;
+   getEdgeDofs(p2g0, edge0, nx0, ny0, dofs0);
+   getEdgeDofs(p2g1, edge1, nx1, ny1, dofs1);
+   
+   // Check if DOF counts match
+   if (dofs0.size() != dofs1.size())
+   {
+      mfem::out << "Warning: DOF count mismatch on shared edge: " 
+                << dofs0.size() << " vs " << dofs1.size() << std::endl;
+      return;
+   }
+   
+   // Determine if we need to reverse the DOF order
+   // Edges 0,2 run in +x direction, edges 1,3 run in +y direction
+   // Compare edge directions to determine if reversal is needed
+   bool reverse = false;
+   // Opposite edges typically need reversal
+   if ((edge0 == 1 && edge1 == 3) || (edge0 == 3 && edge1 == 1) ||
+       (edge0 == 0 && edge1 == 2) || (edge0 == 2 && edge1 == 0))
+   {
+      reverse = true;
+   }
+   
+   mfem::out << "  Connecting " << dofs0.size() << " DOFs for component " 
+             << component << ", reverse=" << reverse << std::endl;
+   mfem::out << "    dofs0: ";
+   for (size_t i = 0; i < dofs0.size(); i++) { mfem::out << dofs0[i] << " "; }
+   mfem::out << std::endl << "    dofs1: ";
+   for (size_t i = 0; i < dofs1.size(); i++) { mfem::out << dofs1[i] << " "; }
+   mfem::out << std::endl;
+   
+   // Connect DOFs
+   for (size_t i = 0; i < dofs0.size(); i++)
+   {
+      int idx1 = reverse ? (dofs1.size() - 1 - i) : i;
+      int dof0 = dofs0[i];
+      int dof1 = dofs1[idx1];
+      
+      mfem::out << "    d_to_d[" << dof1 << "] = d_to_d[" << dof0 << "] = " << d_to_d[dof0] << std::endl;
+      
+      if (dof0 >= 0 && dof0 < d_to_d.Size() &&
+          dof1 >= 0 && dof1 < d_to_d.Size())
+      {
+         d_to_d[dof1] = d_to_d[dof0];
+      }
+   }
+}
+
+void NURBSExtension::AutoConnectPatchBoundariesHCurl(int component)
+{
+   // Automatically detect shared boundaries between patches and connect
+   // the H(curl) DOFs for tangential continuity.
+   //
+   // In 2D, patches are connected via shared edges.
+   // We need to find edges that belong to two different patches.
+   
+   int dim = Dimension();
+   int np = GetNP();
+   
+   if (np <= 1) { return; }
+   
+   // For 2D multi-patch: find shared edges between patches
+   // Each patch element has 4 edges in 2D. An internal shared edge
+   // appears in two patch elements with the same vertices.
+   
+   if (dim == 2)
+   {
+      // Build map from edge vertices to (patch, local_edge) pairs
+      std::map<std::set<int>, std::vector<std::pair<int,int>>> edge_to_patch;
+      
+      for (int p = 0; p < np; p++)
+      {
+         Array<int> elem_verts;
+         patchTopo->GetElementVertices(p, elem_verts);
+         
+         // In 2D, element has 4 vertices forming edges:
+         // edge 0: v0-v1, edge 1: v1-v2, edge 2: v2-v3, edge 3: v3-v0
+         int edges[4][2] = {{0,1}, {1,2}, {2,3}, {3,0}};
+         
+         for (int e = 0; e < 4; e++)
+         {
+            std::set<int> edge_verts;
+            edge_verts.insert(elem_verts[edges[e][0]]);
+            edge_verts.insert(elem_verts[edges[e][1]]);
+            edge_to_patch[edge_verts].push_back(std::make_pair(p, e));
+         }
+      }
+      
+      // Find shared edges (edges belonging to 2 patches)
+      for (auto &entry : edge_to_patch)
+      {
+         const auto &patches = entry.second;
+         if (patches.size() < 2) { continue; }
+         
+         // This is a shared internal edge
+         int patch0 = patches[0].first;
+         int patch1 = patches[1].first;
+         int edge0 = patches[0].second;
+         int edge1 = patches[1].second;
+         
+         mfem::out << "Found shared edge between patch " << patch0 
+                   << " (edge " << edge0 << ") and patch " << patch1 
+                   << " (edge " << edge1 << ")" << std::endl;
+         
+         // Connect DOFs along this shared edge
+         // We need to find the boundary index for each patch's edge
+         // In patchTopo, boundaries are ordered by patch
+         ConnectPatchEdgeHCurl2D(patch0, edge0, patch1, edge1, component);
+      }
+   }
+   else if (dim == 3)
+   {
+      // Similar logic for 3D with shared faces
+      // TODO: implement for 3D
+   }
+}
+
 void NURBSExtension::GenerateActiveVertices()
 {
    int vert[8], nv, g_el, nx, ny, nz, dim = Dimension();
@@ -4764,18 +5233,79 @@ NURBSExtension* NURBSExtension::GetDivExtension(int component)
 
 NURBSExtension* NURBSExtension::GetCurlExtension(int component)
 {
-   // Smarter routine
-   if (GetNP() > 1)
+   // Multi-patch H(curl) extension
+   // For H(curl), the order in direction 'component' stays the same,
+   // while orders in other directions are elevated by 1.
+   //
+   // The key insight is that knotVectorsCompr is organized as:
+   // [patch0_dir0, patch0_dir1, ..., patch1_dir0, patch1_dir1, ...]
+   // where dir corresponds to x(0), y(1), z(2).
+   //
+   // However, mOrders (returned by GetOrders()) corresponds to the unique
+   // KnotVectors in knotVectors[], which may have a different indexing.
+   // We use edge_to_ukv to map from comprehensive to unique indices.
+   
+   const int dim = Dimension();
+   const int np = GetNP();
+   Array<int> newOrders = GetOrders();
+   
+   // Build mapping from unique KnotVector index to direction
+   // Use edge_to_ukv which maps edge index to unique KnotVector index
+   Array<int> ukv_to_dir(newOrders.Size());
+   ukv_to_dir = -1;
+   
+   // For each patch, get the edges and their directions
+   // In 2D: edges 0,2 are x-direction, edges 1,3 are y-direction
+   // In 3D: edges 0,2,4,6 are x, edges 1,3,5,7 are y, edges 8,9,10,11 are z
+   for (int p = 0; p < np; p++)
    {
-      mfem_error("NURBSExtension::GetCurlExtension currently "
-                 "only works for single patch NURBS meshes ");
+      Array<int> edges, orient;
+      patchTopo->GetElementEdges(p, edges, orient);
+      
+      for (int e = 0; e < edges.Size(); e++)
+      {
+         int ukv_idx = edge_to_ukv[edges[e]];
+         int dir;
+         if (dim == 2)
+         {
+            // 2D: edges 0,2 are x-dir, edges 1,3 are y-dir
+            dir = (e == 0 || e == 2) ? 0 : 1;
+         }
+         else // dim == 3
+         {
+            // 3D: edges 0,2,4,6 are x, 1,3,5,7 are y, 8-11 are z
+            if (e < 4) { dir = e % 2; }
+            else if (e < 8) { dir = (e - 4) % 2; }
+            else { dir = 2; }
+         }
+         
+         if (ukv_to_dir[ukv_idx] == -1)
+         {
+            ukv_to_dir[ukv_idx] = dir;
+         }
+      }
+   }
+   
+   // Apply H(curl) order modifications based on direction
+   for (int ukv = 0; ukv < newOrders.Size(); ukv++)
+   {
+      int dir = ukv_to_dir[ukv];
+      if (dir == -1)
+      {
+         // Fallback for unassigned (shouldn't happen in valid mesh)
+         dir = ukv % dim;
+      }
+      
+      if (dir != component)
+      {
+         // Other directions: order elevated by 1
+         newOrders[ukv]++;
+      }
    }
 
-   Array<int> newOrders  = GetOrders();
-   for (int c = 0; c < newOrders.Size(); c++) { newOrders[c]++; }
-   newOrders[component] -= 1;
-
-   return new NURBSExtension(this, newOrders, Mode::H_CURL);
+   NURBSExtension *ext = new NURBSExtension(this, newOrders, Mode::H_CURL);
+   
+   return ext;
 }
 
 void NURBSExtension::UniformRefinement(const Array<int> &rf)

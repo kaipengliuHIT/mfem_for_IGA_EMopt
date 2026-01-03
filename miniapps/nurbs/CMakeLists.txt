@@ -278,6 +278,11 @@ if (MFEM_USE_MPI)
     LIBRARIES mfem)
     add_dependencies(nurbs_ex25p copy_miniapps_nurbs_data)
 
+  add_mfem_miniapp(nurbs_ex25p_multipatch
+    MAIN nurbs_ex25p_multipatch.cpp
+    LIBRARIES mfem)
+    add_dependencies(nurbs_ex25p_multipatch copy_miniapps_nurbs_data)
+
   
   if (MFEM_ENABLE_TESTING)
     add_test(NAME nurbs_ex1p_np=4

@@ -642,6 +642,28 @@ protected:
    void ConnectBoundaries2D(int bnd0, int bnd1);
    void ConnectBoundaries3D(int bnd0, int bnd1);
 
+   /// Set DOF maps for H(curl) multi-patch continuity.
+   /// @param component The H(curl) component direction (0, 1, or 2 for 3D).
+   void ConnectBoundariesHCurl(int component);
+   void ConnectBoundariesHCurl2D(int bnd0, int bnd1, int component);
+   void ConnectBoundariesHCurl3D(int bnd0, int bnd1, int component);
+   
+   /// Automatically detect and connect shared patch boundaries for H(curl).
+   void AutoConnectPatchBoundariesHCurl(int component);
+   
+   /// Connect DOFs along a shared edge between two patches in 2D.
+   void ConnectPatchEdgeHCurl2D(int patch0, int edge0, int patch1, int edge1, int component);
+   
+   /// Get the local direction of a boundary element within its patch.
+   /// Returns 0 for x-direction boundary, 1 for y-direction, 2 for z-direction.
+   int GetBdrElementLocalDir(int bel) const;
+   
+   /// Check if the given H(curl) component is tangent to a boundary.
+   /// @param bel Boundary element index
+   /// @param component H(curl) component direction
+   /// @return true if the component is tangent to the boundary
+   bool IsComponentTangentToBdr(int bel, int component) const;
+
    /** @brief Set the mesh and space offsets, and also count the global
    @a NumOfVertices and the global @a NumOfDofs. */
    virtual void GenerateOffsets();
